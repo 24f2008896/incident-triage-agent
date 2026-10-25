@@ -380,6 +380,8 @@ async def create_incident(request: Request) -> JSONResponse:
             return JSONResponse(public_state(json.loads(existing["state_json"])))
 
         plan = planner(body)
+        print("DEBUG planner rootCause:", repr(plan.get("rootCause")))
+        print("DEBUG allowedRootCauses:", repr(body["incident"].get("allowedRootCauses", [])))
         allowed = body["incident"].get("allowedRootCauses", [])
         if plan.get("rootCause") not in allowed:
             raise HTTPException(status_code=422, detail="Planner returned an unsupported root cause")
