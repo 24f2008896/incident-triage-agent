@@ -380,6 +380,9 @@ async def create_incident(request: Request) -> JSONResponse:
             return JSONResponse(public_state(json.loads(existing["state_json"])))
 
         plan = planner(body)
+        print("DEBUG evidence:", repr(plan.get("evidence")))
+        print("DEBUG diagnostics:", repr(plan.get("diagnostics")))
+        print("DEBUG chosenEffect:", repr(plan.get("chosenEffect")))
         print("DEBUG planner rootCause:", repr(plan.get("rootCause")))
         print("DEBUG allowedRootCauses:", repr(body["incident"].get("allowedRootCauses", [])))
         allowed = body["incident"].get("allowedRootCauses", [])
