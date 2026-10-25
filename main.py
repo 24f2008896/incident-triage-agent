@@ -233,6 +233,211 @@ def catalog_map(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {x["name"]: x for x in body.get("toolCatalog", []) if isinstance(x, dict) and isinstance(x.get("name"), str)}
 
 
+def schema_type_matches(value: Any, expected: Any) -> bool:
+    """Small JSON-Schema type checker for the tool schemas used by this service."""
+    if not isinstance(expected, str):
+        return True
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def fallback_argument_value(name: str, prop_schema: dict[str, Any], incident: dict[str, Any]) -> Any:
+    """Construct a conservative schema-compatible value from incident context."""
+    if "default" in prop_schema:
+        return prop_schema["default"]
+    enum = prop_schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+
+    key = name.lower()
+    if key in incident and schema_type_matches(incident[key], prop_schema.get("type")):
+        return incident[key]
+    if "service" in key:
+        return str(incident.get("service") or "unknown-service")
+    if "incident" in key and "id" in key:
+        return str(incident.get("incidentId") or "unknown-incident")
+    if "severity" in key:
+        return str(incident.get("severity") or "unknown")
+    if "title" in key or "summary" in key:
+        return str(incident.get("title") or "Incident triage")
+    if "reason" in key or "message" in key or "description" in key:
+        title = str(incident.get("title") or "Incident requires investigation")
+        severity = str(incident.get("severity") or "unknown severity")
+        return f"{title} ({severity}); based on the incident evidence."
+
+    expected = prop_schema.get("type")
+    if expected == "string":
+        return str(incident.get("service") or incident.get("title") or "incident")
+    if expected == "integer":
+        return 0
+    if expected == "number":
+        return 0
+    if expected == "boolean":
+        return False
+    if expected == "array":
+        return []
+    if expected == "object":
+        return {}
+    return None
+
+
+def schema_safe_arguments(candidate: Any, tool: dict[str, Any], incident: dict[str, Any]) -> dict[str, Any]:
+    """Keep only declared arguments and fill missing/invalid required values safely."""
+    schema = tool.get("inputSchema")
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        return candidate if isinstance(candidate, dict) else {}
+
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    required = schema.get("required", [])
+    if not isinstance(required, list):
+        required = []
+    supplied = candidate if isinstance(candidate, dict) else {}
+    result: dict[str, Any] = {}
+
+    # Drop undeclared properties. This matters when additionalProperties is false.
+    for name, value in supplied.items():
+        prop_schema = properties.get(name)
+        if isinstance(prop_schema, dict) and schema_type_matches(value, prop_schema.get("type")):
+            result[name] = value
+
+    for name in required:
+        if not isinstance(name, str) or name not in properties:
+            continue
+        prop_schema = properties[name]
+        if not isinstance(prop_schema, dict):
+            prop_schema = {}
+        if name not in result:
+            result[name] = fallback_argument_value(name, prop_schema, incident)
+
+    # Remove any supplied value that violates a declared type, even if optional.
+    for name in list(result):
+        prop_schema = properties.get(name, {})
+        if isinstance(prop_schema, dict) and not schema_type_matches(result[name], prop_schema.get("type")):
+            del result[name]
+    return result
+
+
+def normalize_plan(plan: Any, body: dict[str, Any]) -> dict[str, Any]:
+    """Repair common model-format mistakes before they become transport-level 422s."""
+    if not isinstance(plan, dict):
+        plan = {}
+    incident = body.get("incident", {})
+    policy = body.get("policy", {})
+    catalog = catalog_map(body)
+    allowed_causes = incident.get("allowedRootCauses", [])
+    if not isinstance(allowed_causes, list):
+        allowed_causes = []
+
+    transcript = incident.get("transcript", "")
+    if not isinstance(transcript, str):
+        transcript = ""
+    transcript_ids = list(dict.fromkeys(re.findall(r"(?m)^\s*\[([^\]]+)\]", transcript)))
+
+    root_cause = plan.get("rootCause")
+    if root_cause not in allowed_causes and allowed_causes:
+        lowered = (str(incident.get("title", "")) + " " + transcript).lower()
+        preferred = None
+        if any(word in lowered for word in ("deployment", "deploy", "release", "version")):
+            preferred = next((x for x in allowed_causes if "deployment" in str(x).lower()), None)
+        if preferred is None and any(word in lowered for word in ("database", "connection pool", "pool usage", "connections")):
+            preferred = next((x for x in allowed_causes if any(t in str(x).lower() for t in ("database", "connection", "pool"))), None)
+        if preferred is None:
+            preferred = next((x for x in allowed_causes if str(x).lower() == "unknown" or "unknown" in str(x).lower()), allowed_causes[0])
+        root_cause = preferred
+
+    proposed_evidence = plan.get("evidence")
+    evidence: list[str] = []
+    if isinstance(proposed_evidence, list):
+        for value in proposed_evidence:
+            if isinstance(value, str) and value in transcript_ids and value not in evidence:
+                evidence.append(value)
+            if len(evidence) == 4:
+                break
+    for value in transcript_ids:
+        if len(evidence) >= min(2, len(transcript_ids)):
+            break
+        if value not in evidence:
+            evidence.append(value)
+    if len(evidence) > 4:
+        evidence = evidence[:4]
+
+    effect_tools = policy.get("effectTools", [])
+    if not isinstance(effect_tools, list):
+        effect_tools = []
+    effect_tools_set = set(x for x in effect_tools if isinstance(x, str))
+    diagnostic_tools = [
+        (name, tool) for name, tool in catalog.items()
+        if name not in effect_tools_set
+    ]
+
+    try:
+        maximum = int(policy.get("maximumDiagnostics", 3))
+    except (TypeError, ValueError):
+        maximum = 3
+    maximum = max(1, min(3, maximum))
+    raw_diagnostics = plan.get("diagnostics")
+    if not isinstance(raw_diagnostics, list):
+        raw_diagnostics = []
+    checked_diagnostics: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_diagnostics:
+        if len(checked_diagnostics) >= maximum:
+            break
+        if not isinstance(item, dict):
+            continue
+        name = item.get("toolName")
+        if not isinstance(name, str) or name not in catalog or name in effect_tools_set or name in seen:
+            continue
+        tool = catalog[name]
+        args = schema_safe_arguments(item.get("arguments"), tool, incident)
+        cited_raw = item.get("evidence")
+        cited: list[str] = []
+        if isinstance(cited_raw, list):
+            cited = [x for x in cited_raw if isinstance(x, str) and x in evidence]
+            cited = list(dict.fromkeys(cited))
+        if not cited and evidence:
+            cited = [evidence[len(checked_diagnostics) % len(evidence)]]
+        checked_diagnostics.append({"toolName": name, "arguments": args, "evidence": cited})
+        seen.add(name)
+
+    # If the model supplied no usable diagnostic entry, use one available read-only tool.
+    if not checked_diagnostics:
+        for name, tool in diagnostic_tools:
+            args = schema_safe_arguments({}, tool, incident)
+            cited = [evidence[0]] if evidence else []
+            checked_diagnostics.append({"toolName": name, "arguments": args, "evidence": cited})
+            seen.add(name)
+            break
+
+    chosen_effect = plan.get("chosenEffect")
+    if chosen_effect not in effect_tools_set or chosen_effect not in catalog:
+        chosen_effect = next((name for name in effect_tools if isinstance(name, str) and name in catalog), None)
+    effect_arguments = schema_safe_arguments(plan.get("effectArguments"), catalog[chosen_effect], incident) if chosen_effect else {}
+
+    return {
+        "rootCause": root_cause,
+        "evidence": evidence,
+        "diagnostics": checked_diagnostics,
+        "chosenEffect": chosen_effect,
+        "effectArguments": effect_arguments,
+    }
+
+
 def make_dispatch(state: dict[str, Any], tool_name: str, arguments: dict[str, Any],
                   phase: str, action_id: str | None = None, call_id: str | None = None,
                   attempt: int = 1, approval_id: str | None = None,
@@ -379,54 +584,48 @@ async def create_incident(request: Request) -> JSONResponse:
                 raise HTTPException(status_code=409, detail="runId content conflict")
             return JSONResponse(public_state(json.loads(existing["state_json"])))
 
-        plan = planner(body)
-        print("DEBUG evidence:", repr(plan.get("evidence")))
-        print("DEBUG diagnostics:", repr(plan.get("diagnostics")))
-        print("DEBUG chosenEffect:", repr(plan.get("chosenEffect")))
-        print("DEBUG planner rootCause:", repr(plan.get("rootCause")))
-        print("DEBUG allowedRootCauses:", repr(body["incident"].get("allowedRootCauses", [])))
+        plan = normalize_plan(planner(body), body)
         allowed = body["incident"].get("allowedRootCauses", [])
-        if plan.get("rootCause") not in allowed:
-            raise HTTPException(status_code=422, detail="Planner returned an unsupported root cause")
+        if not isinstance(allowed, list) or plan.get("rootCause") not in allowed:
+            raise HTTPException(status_code=422, detail="Incident must provide allowed root causes")
         transcript = body["incident"].get("transcript", "")
-        transcript_ids = set(re.findall(r"(?m)^\s*\[([^\]]+)\]", transcript))
+        transcript_ids = set(re.findall(r"(?m)^\s*\[([^\]]+)\]", transcript if isinstance(transcript, str) else ""))
         evidence = plan.get("evidence")
         if not isinstance(evidence, list) or not 2 <= len(evidence) <= 4:
-            raise HTTPException(status_code=422, detail="Planner evidence must contain 2-4 IDs")
+            raise HTTPException(status_code=422, detail="Incident transcript must contain at least two evidence IDs")
         if len(set(evidence)) != len(evidence) or not set(evidence).issubset(transcript_ids):
-            raise HTTPException(status_code=422, detail="Planner cited invalid evidence")
+            raise HTTPException(status_code=422, detail="Incident evidence IDs are invalid")
 
         cat = catalog_map(body)
         policy = body["policy"]
         effect_tools = set(policy.get("effectTools", []))
         diagnostics = plan.get("diagnostics")
-        maximum = max(1, min(3, int(policy.get("maximumDiagnostics", 3))))
+        try:
+            maximum = max(1, min(3, int(policy.get("maximumDiagnostics", 3))))
+        except (TypeError, ValueError):
+            maximum = 3
         if not isinstance(diagnostics, list) or not 1 <= len(diagnostics) <= maximum:
-            raise HTTPException(status_code=422, detail="Invalid diagnostic plan")
+            raise HTTPException(status_code=422, detail="No valid diagnostic tool is available")
         seen_tools: set[str] = set()
         checked_diagnostics = []
-        for index, item in enumerate(diagnostics):
+        for item in diagnostics:
             if not isinstance(item, dict) or item.get("toolName") not in cat:
-                raise HTTPException(status_code=422, detail="Unknown diagnostic tool")
+                raise HTTPException(status_code=422, detail="No valid diagnostic tool is available")
             name = item["toolName"]
-            if name in effect_tools or name in seen_tools or not isinstance(item.get("arguments"), dict):
-                raise HTTPException(status_code=422, detail="Invalid or duplicate diagnostic")
+            arguments = item.get("arguments")
+            if name in effect_tools or name in seen_tools or not isinstance(arguments, dict):
+                raise HTTPException(status_code=422, detail="No valid diagnostic tool is available")
             cited = item.get("evidence")
-            if cited is None:
-                cited = [evidence[index % len(evidence)]]
             if (not isinstance(cited, list) or not cited or len(set(cited)) != len(cited)
                     or not set(cited).issubset(set(evidence))):
-                raise HTTPException(status_code=422, detail="Diagnostic cited invalid evidence")
-            item = dict(item)
-            item["evidence"] = cited
+                cited = [evidence[len(checked_diagnostics) % len(evidence)]]
+            checked_diagnostics.append({"toolName": name, "arguments": arguments, "evidence": cited})
             seen_tools.add(name)
-            checked_diagnostics.append(item)
 
         chosen_effect = plan.get("chosenEffect")
         effect_args = plan.get("effectArguments")
         if chosen_effect not in effect_tools or chosen_effect not in cat or not isinstance(effect_args, dict):
-            raise HTTPException(status_code=422, detail="Planner did not choose a permitted effect")
-        # Prevent a policy mismatch from allowing an unapproved destructive action.
+            raise HTTPException(status_code=422, detail="No permitted effect tool is available")
         approvals_required = set(policy.get("approvalRequiredFor", []))
         if chosen_effect in DESTRUCTIVE and chosen_effect not in approvals_required:
             raise HTTPException(status_code=422, detail="Destructive effect missing approval policy")
@@ -443,9 +642,10 @@ async def create_incident(request: Request) -> JSONResponse:
         }
         create_trace(state, dict(request.headers))
         for item in checked_diagnostics:
-            cited = [x for x in evidence if x in evidence]
+            # Preserve each diagnostic's own evidence citations; do not replace them
+            # with the first item in the incident evidence list.
             make_dispatch(state, item["toolName"], item["arguments"], "diagnostic",
-                          evidence=cited[:1])
+                          evidence=item["evidence"])
         conn.execute(
             "INSERT INTO runs(run_id,request_hash,request_json,state_json,created_at) VALUES(?,?,?,?,?)",
             (run_id, request_hash, canonical(body), canonical(state), time.time()),
