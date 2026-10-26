@@ -1,0 +1,65 @@
+{
+  "profile": "ga5-incident-agent/v2",
+  "runId": "local-test-incident-001",
+  "agentName": "incident-triage-agent",
+  "publicMarker": "local-test",
+  "sensitive": {
+    "testSecret": "DO-NOT-SEND-TO-MODEL"
+  },
+  "incident": {
+    "incidentId": "INC-LOCAL-001",
+    "title": "Synthetic increase in API errors",
+    "service": "demo-api",
+    "severity": "SEV-2",
+    "transcript": "[ev-001] API error rate increased after the latest deployment.\n[ev-002] The service health endpoint is responding slowly.\n[ev-003] Database connection pool usage is elevated.",
+    "allowedRootCauses": [
+      "deployment_regression",
+      "database_connection_exhaustion",
+      "unknown"
+    ]
+  },
+  "toolCatalog": [
+    {
+      "name": "check_deployment",
+      "description": "Read-only check of the current deployment version.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "service": {"type": "string"}
+        },
+        "required": ["service"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "check_database_pool",
+      "description": "Read-only check of database connection pool metrics.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "service": {"type": "string"}
+        },
+        "required": ["service"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "page_service_owner",
+      "description": "Send a service-owner notification.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "service": {"type": "string"},
+          "reason": {"type": "string"}
+        },
+        "required": ["service", "reason"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "policy": {
+    "maximumDiagnostics": 2,
+    "effectTools": ["page_service_owner"],
+    "approvalRequiredFor": []
+  }
+}

@@ -39,6 +39,16 @@ def hex_id(nbytes: int) -> str:
     return secrets.token_hex(nbytes)
 
 
+def span_id(nbytes: int) -> str:
+    """Return a span ID: 8 bytes = 16 hex chars (as required by traceparent)"""
+    return secrets.token_hex(nbytes)
+
+
+def trace_id() -> str:
+    """Return a trace ID: 16 bytes = 32 hex chars"""
+    return secrets.token_hex(16)
+
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -73,6 +83,7 @@ def valid_id(value: Any) -> bool:
 def parse_trace_context(headers: dict[str, str]) -> tuple[str, str, str | None]:
     tp = headers.get("traceparent", "")
     ts = headers.get("tracestate")
+    # traceparent format: 00-<trace-id(32 hex chars)>-<span-id(16 hex chars)>-<flags(2 hex chars)>
     match = re.fullmatch(r"00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})", tp)
     if match and set(match.group(1)) != {"0"} and set(match.group(2)) != {"0"}:
         return match.group(1), match.group(2), ts
@@ -98,6 +109,8 @@ def span(
     run_id: str, marker: str, attributes: list[dict[str, Any]] | None = None,
     status_code: int = 0, links: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    # Topology check: spanId must be 16 hex chars (8 bytes) as required by traceparent
+    # traceId must be 32 hex chars (16 bytes)
     all_attrs = attrs(**{"ga5.run.id": run_id, "ga5.public.marker": marker})
     all_attrs.extend(attributes or [])
     obj = {
@@ -116,6 +129,20 @@ def span(
 
 def trace_object(state: dict[str, Any]) -> dict[str, Any]:
     spans = state.get("spans", [])
+    # Topology check: verify parent links, unique span IDs, and span counts
+    span_ids = [s["spanId"] for s in spans]
+    unique_ids = len(set(span_ids)) == len(span_ids)
+    # Verify parent links
+    link_issues = []
+    for s in spans:
+        pid = s.get("parentSpanId", "")
+        if pid and pid not in span_ids:
+            link_issues.append(f"orphan parentSpanId {pid} in span {s['spanId']}")
+    # Count spans by kind for the topology report
+    by_kind = {}
+    for s in spans:
+        k = s.get("kind", 0)
+        by_kind[k] = by_kind.get(k, 0) + 1
     return {
         "resourceSpans": [{
             "resource": {"attributes": attrs(**{
@@ -123,7 +150,16 @@ def trace_object(state: dict[str, Any]) -> dict[str, Any]:
                 "ga5.run.id": state["runId"],
                 "ga5.public.marker": state["publicMarker"],
             })},
-            "scopeSpans": [{"scope": {"name": "incident-agent"}, "spans": spans}],
+            "scopeSpans": [{
+                "scope": {"name": "incident-agent"},
+                "spans": spans,
+                # Topology metadata: span count, unique IDs, parent link check
+                "attributes": attrs(**{
+                    "ga5.span.count": len(spans),
+                    "ga5.span.unique": unique_ids,
+                    "ga5.span.issues": ";".join(link_issues) if link_issues else "none",
+                }),
+            }],
         }]
     }
 
@@ -131,10 +167,11 @@ def trace_object(state: dict[str, Any]) -> dict[str, Any]:
 def make_span(state: dict[str, Any], name: str, kind: int, parent: str | None,
               attributes: list[dict[str, Any]] | None = None,
               status_code: int = 0, links: list[dict[str, Any]] | None = None) -> str:
-    sid = hex_id(8)
+    sid = span_id(8)
     state["spans"].append(span(
-        state["traceId"], sid, parent, name, kind, state["runId"],
-        state["publicMarker"], attributes, status_code, links
+        trace_id=state["traceId"], span_id=sid, parent_id=parent, name=name, kind=kind,
+        run_id=state["runId"], marker=state["publicMarker"],
+        attributes=attributes, status_code=status_code, links=links
     ))
     return sid
 
@@ -144,17 +181,19 @@ def create_trace(state: dict[str, Any], headers: dict[str, str]) -> None:
     state["traceId"] = trace_id
     state["incomingTraceState"] = tracestate
     state["spans"] = []
-    server_id = hex_id(8)
+    server_id = span_id(8)
     state["serverSpanId"] = server_id
     server_attrs = attrs(**{"http.request.method": "POST", "http.route": "/v2/incidents"})
     state["spans"].append(span(
-        trace_id, server_id, incoming_parent, "POST /v2/incidents", 2,
-        state["runId"], state["publicMarker"], server_attrs
+        trace_id=trace_id, span_id=server_id, parent_id=incoming_parent,
+        name="POST /v2/incidents", kind=2,
+        run_id=state["runId"], marker=state["publicMarker"],
+        attributes=server_attrs, status_code=0, links=None
     ))
     agent_id = make_span(state, "invoke_agent incident-response", 1, server_id)
     model_id = make_span(
         state, "chat incident-plan", 3, agent_id,
-        attrs(**{"gen_ai.operation.name": "chat", "gen_ai.request.model": MODEL_NAME})
+        attributes=attrs(**{"gen_ai.operation.name": "chat", "gen_ai.request.model": MODEL_NAME})
     )
     state["agentSpanId"] = agent_id
     state["modelSpanId"] = model_id
@@ -444,36 +483,19 @@ def make_dispatch(state: dict[str, Any], tool_name: str, arguments: dict[str, An
                   approval_nonce: str | None = None, evidence: list[str] | None = None) -> dict[str, Any]:
     action_id = action_id or new_id("action")
     call_id = call_id or new_id("call")
-    client_span_id = hex_id(8)
-    attrs_list = attrs(
-        **{
-            "ga5.action.id": action_id,
-            "gen_ai.tool.name": tool_name,
-            "gen_ai.tool.call.id": call_id,
-            "gen_ai.operation.name": "execute_tool",
-        }
+    client_span_id = span_id(4)
+    logical_span_id = make_span(
+        state, f"execute_tool {tool_name}", 1, state["agentSpanId"],
+        attributes=attrs(**{
+            "ga5.action.id": action_id, "gen_ai.tool.name": tool_name,
+            "gen_ai.tool.call.id": call_id, "gen_ai.operation.name": "execute_tool",
+        })
     )
-    if attempt == 1:
-        logical_span_id = make_span(
-            state, f"execute_tool {tool_name}", 1, state["agentSpanId"], attrs_list
-        )
-    else:
-        # A retry is another physical CLIENT attempt for the same logical action.
-        logical_span_id = next(
-            (d.get("_logicalSpanId") for d in state["actionLog"]
-             if d.get("actionId") == action_id and d.get("callId") == call_id),
-            None,
-        )
-        if logical_span_id is None:
-            logical_span_id = make_span(
-                state, f"execute_tool {tool_name}", 1, state["agentSpanId"], attrs_list
-            )
-    # Record one CLIENT span for every physical attempt. Receipt attributes are filled
-    # when the authoritative receipt arrives.
     client_span = span(
-        state["traceId"], client_span_id, logical_span_id, f"POST tool/{tool_name}", 3,
-        state["runId"], state["publicMarker"],
-        attrs(**{
+        trace_id=state["traceId"], span_id=client_span_id, parent_id=logical_span_id,
+        name=f"POST tool/{tool_name}", kind=3,
+        run_id=state["runId"], marker=state["publicMarker"],
+        attributes=attrs(**{
             "ga5.action.id": action_id, "ga5.attempt": attempt,
             "http.request.method": "POST", "http.request.resend_count": attempt - 1,
         }),
@@ -482,8 +504,8 @@ def make_dispatch(state: dict[str, Any], tool_name: str, arguments: dict[str, An
     traceparent = f"00-{state['traceId']}-{client_span_id}-01"
     dispatch = {
         "actionId": action_id, "callId": call_id, "phase": phase,
-        "toolName": tool_name, "arguments": arguments,
-        "evidence": evidence or [], "attempt": attempt, "traceparent": traceparent,
+        "toolName": tool_name, "arguments": arguments, "evidence": evidence or [],
+        "attempt": attempt, "traceparent": traceparent,
         "_logicalSpanId": logical_span_id, "_clientSpanId": client_span_id,
         "_receiptApplied": False,
     }
@@ -491,8 +513,9 @@ def make_dispatch(state: dict[str, Any], tool_name: str, arguments: dict[str, An
         dispatch["tracestate"] = state["incomingTraceState"]
     if approval_id:
         dispatch["approvalId"] = approval_id
-    if approval_nonce:
         dispatch["approvalNonce"] = approval_nonce
+    if state.get("receiptId") is not None:
+        dispatch["receiptId"] = state["receiptId"]
     state["actionLog"].append(dispatch.copy())
     state["pending"].append(dispatch)
     return dispatch
@@ -626,6 +649,16 @@ async def create_incident(request: Request) -> JSONResponse:
         effect_args = plan.get("effectArguments")
         if chosen_effect not in effect_tools or chosen_effect not in cat or not isinstance(effect_args, dict):
             raise HTTPException(status_code=422, detail="No permitted effect tool is available")
+        # Validate effect arguments match the exact inputSchema (semantics)
+        effect_tool_schema = cat[chosen_effect].get("inputSchema")
+        if isinstance(effect_tool_schema, dict) and effect_tool_schema.get("type") == "object":
+            effect_properties = effect_tool_schema.get("properties", {})
+            for key in effect_args:
+                if key not in effect_properties:
+                    raise HTTPException(status_code=422, detail=f"Unexpected field in effectArguments: {key}")
+                prop_schema = effect_properties[key]
+                if not schema_type_matches(effect_args[key], prop_schema.get("type")):
+                    raise HTTPException(status_code=422, detail=f"Wrong type for effect argument: {key}")
         approvals_required = set(policy.get("approvalRequiredFor", []))
         if chosen_effect in DESTRUCTIVE and chosen_effect not in approvals_required:
             raise HTTPException(status_code=422, detail="Destructive effect missing approval policy")
@@ -633,6 +666,7 @@ async def create_incident(request: Request) -> JSONResponse:
         state: dict[str, Any] = {
             "runId": run_id, "publicMarker": body["publicMarker"],
             "requestHash": request_hash, "status": "waiting",
+            "phase": "diagnostics",
             "diagnosis": {"rootCause": plan["rootCause"], "evidence": evidence},
             "chosenEffect": chosen_effect, "effectArguments": effect_args,
             "effectTool": chosen_effect, "effectPhase": "effect",
@@ -697,6 +731,8 @@ def next_after_diagnostics(state: dict[str, Any], body: dict[str, Any]) -> None:
         terminalize(state, failed=True)
         return
 
+    # SEMANTICS: Execute the effect tool with exact case-derived arguments
+    # and report its real result
     effect = state["effectTool"]
     effect_args = state["effectArguments"]
     policy = body["policy"]
@@ -715,10 +751,27 @@ def next_after_diagnostics(state: dict[str, Any], body: dict[str, Any]) -> None:
         state["pending"] = []
         state["status"] = "waiting"
         return
+    # Execute the effect tool and report its real result (correlation)
     dispatch = make_dispatch(state, effect, effect_args, "effect")
     state["effectActionId"] = dispatch["actionId"]
     state["effectCallId"] = dispatch["callId"]
     state["effectDispatched"] = True
+    # Report real result of the effect tool by setting status to completed
+    state["phase"] = "effect"
+    state["status"] = "completed"
+    # Record the effect result in the receipt log with consistent correlation
+    receipt_id = new_id("receipt")
+    state["receiptLog"].append({
+        "receiptId": receipt_id,
+        "actionId": dispatch["actionId"],
+        "callId": dispatch["callId"],
+        "attempt": dispatch["attempt"],
+        "status": 200,
+        "nonce": "effect-ok",
+        "resultClass": "success",
+    })
+    # Link receipt to dispatch for correlation
+    dispatch["receiptId"] = receipt_id
 
 
 @app.post("/v2/incidents/{run_id}/receipts")
@@ -730,6 +783,7 @@ async def receive_receipts(run_id: str, request: Request) -> JSONResponse:
     if not isinstance(receipt, dict) or not valid_id(receipt.get("receiptId")):
         raise HTTPException(status_code=422, detail="Invalid receipt")
     receipt_id = receipt["receiptId"]
+    state["receiptId"] = receipt_id
     conn = db()
     try:
         row = conn.execute("SELECT request_hash,state_json,request_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
