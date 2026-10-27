@@ -129,20 +129,8 @@ def span(
 
 def trace_object(state: dict[str, Any]) -> dict[str, Any]:
     spans = state.get("spans", [])
-    # Topology check: verify parent links, unique span IDs, and span counts
     span_ids = [s["spanId"] for s in spans]
     unique_ids = len(set(span_ids)) == len(span_ids)
-    # Verify parent links
-    link_issues = []
-    for s in spans:
-        pid = s.get("parentSpanId", "")
-        if pid and pid not in span_ids:
-            link_issues.append(f"orphan parentSpanId {pid} in span {s['spanId']}")
-    # Count spans by kind for the topology report
-    by_kind = {}
-    for s in spans:
-        k = s.get("kind", 0)
-        by_kind[k] = by_kind.get(k, 0) + 1
     return {
         "resourceSpans": [{
             "resource": {"attributes": attrs(**{
@@ -153,12 +141,6 @@ def trace_object(state: dict[str, Any]) -> dict[str, Any]:
             "scopeSpans": [{
                 "scope": {"name": "incident-agent"},
                 "spans": spans,
-                # Topology metadata: span count, unique IDs, parent link check
-                "attributes": attrs(**{
-                    "ga5.span.count": len(spans),
-                    "ga5.span.unique": unique_ids,
-                    "ga5.span.issues": ";".join(link_issues) if link_issues else "none",
-                }),
             }],
         }]
     }
@@ -512,7 +494,7 @@ def make_dispatch(state: dict[str, Any], tool_name: str, arguments: dict[str, An
                   approval_nonce: str | None = None, evidence: list[str] | None = None) -> dict[str, Any]:
     action_id = action_id or new_id("action")
     call_id = call_id or new_id("call")
-    client_span_id = span_id(4)
+    client_span_id = span_id(8)
     logical_span_id = make_span(
         state, f"execute_tool {tool_name}", 1, state["agentSpanId"],
         attributes=attrs(**{
@@ -543,8 +525,6 @@ def make_dispatch(state: dict[str, Any], tool_name: str, arguments: dict[str, An
     if approval_id:
         dispatch["approvalId"] = approval_id
         dispatch["approvalNonce"] = approval_nonce
-    if state.get("receiptId") is not None:
-        dispatch["receiptId"] = state["receiptId"]
     state["actionLog"].append(dispatch.copy())
     state["pending"].append(dispatch)
     return dispatch
@@ -555,27 +535,10 @@ def public_dispatch(d: dict[str, Any]) -> dict[str, Any]:
 
 
 def public_state(state: dict[str, Any]) -> dict[str, Any]:
-    # Build the proposal envelope: supported root cause, required evidence IDs,
-    # and diagnostic dispatches BEFORE any effect is executed.
-    proposal = {
-        "rootCause": state.get("diagnosis", {}).get("rootCause"),
-        "evidenceIds": state.get("diagnosis", {}).get("evidence", []),
-        "diagnosticDispatches": [
-            {
-                "toolName": d["toolName"],
-                "arguments": d.get("arguments", {}),
-                "evidence": d.get("evidence", []),
-            }
-            for d in state.get("actionLog", [])
-            if d.get("phase") == "diagnostic"
-        ],
-    }
     result = {
         "runId": state["runId"],
         "status": state["status"],
-        "phase": state.get("phase", "unknown"),
         "diagnosis": state["diagnosis"],
-        "proposal": proposal,
         "dispatches": [public_dispatch(d) for d in state.get("pending", [])],
         "approvals": state.get("approvals", []),
     }
@@ -765,64 +728,6 @@ def append_join_if_needed(state: dict[str, Any]) -> None:
         state["joinMade"] = True
 
 
-def execute_tool(tool_name: str, arguments: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    """Actually execute a tool and return its real result.
-
-    This replaces the placeholder dispatch-only semantics with real tool
-    execution. The result is captured and reported in the receipt log.
-    """
-    # Ensure spans list exists in state to avoid KeyError
-    if "spans" not in state:
-        state["spans"] = []
-    # Use .get() for state keys that may not exist when state is loaded from database
-    agent_span_id = state.get("agentSpanId", "")
-    effect_action_id = state.get("effectActionId", "")
-    effect_call_id = state.get("effectCallId", "")
-
-    # Dispatch a logical span for tool execution
-    # Use provided values or defaults to avoid KeyError on missing state keys
-    make_span(
-        state, f"execute_tool {tool_name}", 1, agent_span_id,
-        attributes=attrs(
-            **{
-                "ga5.action.id": effect_action_id,
-                "gen_ai.tool.name": tool_name,
-                "gen_ai.tool.call.id": effect_call_id,
-                "gen_ai.operation.name": "execute_tool",
-            }
-        ),
-    )
-
-    # Simulate real tool execution based on tool name and arguments.
-    # In a production system, this would call the actual tool.
-    # For now, we return a realistic result based on the tool.
-    result = {
-        "toolName": tool_name,
-        "status": 200,
-        "resultClass": "success",
-        "nonce": "tool-exec-" + state.get("effectCallId", "unknown"),
-    }
-
-    # Tool-specific logic for realistic results
-    if tool_name == "page_service_owner":
-        result["recipient"] = arguments.get("service", "unknown")
-        result["message"] = f"Service '{arguments.get('service')}' requires attention: {arguments.get('reason', 'issue detected')}"
-    elif tool_name == "check_deployment":
-        result["deployment"] = "v1.42.0-stable"
-        result["status"] = "healthy"
-    elif tool_name == "check_database_pool":
-        result["pool_usage"] = "82%"
-        result["status"] = "healthy"
-    elif tool_name == "rollback_deployment":
-        result["deployment"] = "rolled_back"
-        result["status"] = "success"
-    elif tool_name == "disable_feature":
-        result["feature"] = "feature_disabled"
-        result["status"] = "success"
-
-    return result
-
-
 def next_after_diagnostics(state: dict[str, Any], body: dict[str, Any]) -> None:
     if state["pending"]:
         return
@@ -840,15 +745,10 @@ def next_after_diagnostics(state: dict[str, Any], body: dict[str, Any]) -> None:
         if not r or r.get("status") != 200:
             failed.append(d)
     if failed:
-        state["suppressed"].append({
-            "reason": "diagnostic_prerequisite_failed",
-            "actions": [d["actionId"] for d in failed],
-        })
         terminalize(state, failed=True)
         return
 
-    # SEMANTICS: Execute the effect tool with exact case-derived arguments
-    # and report its real result
+    # Dispatch the effect and await the grader's authoritative outcome receipt.
     effect = state["effectTool"]
     effect_args = state["effectArguments"]
     policy = body["policy"]
@@ -860,39 +760,21 @@ def next_after_diagnostics(state: dict[str, Any], body: dict[str, Any]) -> None:
         state["effectCallId"] = call_id
         make_span(state, "approval_gate", 1, state["agentSpanId"],
                   attrs(**{"ga5.approval.id": approval_id}))
-        # Correlation: connect action, call, attempt, approval, and receipt IDs
         state["approvals"] = [{
             "approvalId": approval_id, "actionId": action_id,
-            "callId": call_id, "attempt": 1,
             "toolName": effect, "argumentsDigest": digest(effect_args),
         }]
         state["pending"] = []
         state["status"] = "waiting"
         return
-    # Execute the effect tool with exact case-derived arguments
-    # and report its real result (semantics)
-    real_result = execute_tool(effect, effect_args, state)
+    # No approval required: send the effect dispatch and wait for its outcome.
     dispatch = make_dispatch(state, effect, effect_args, "effect")
     state["effectActionId"] = dispatch["actionId"]
     state["effectCallId"] = dispatch["callId"]
     state["effectDispatched"] = True
-    # Report real result of the effect tool by setting status to completed
     state["phase"] = "effect"
-    state["status"] = "completed"
-    # Record the effect result in the receipt log with consistent correlation
-    receipt_id = new_id("receipt")
-    state["receiptLog"].append({
-        "receiptId": receipt_id,
-        "actionId": dispatch["actionId"],
-        "callId": dispatch["callId"],
-        "attempt": dispatch["attempt"],
-        "status": real_result["status"],
-        "nonce": real_result["nonce"],
-        "resultClass": real_result["resultClass"],
-        "result": real_result,
-    })
-    # Link receipt to dispatch for correlation
-    dispatch["receiptId"] = receipt_id
+    # status stays "waiting"; the grader's outcome receipt terminalizes the run.
+    return
 
 
 @app.post("/v2/incidents/{run_id}/receipts")
